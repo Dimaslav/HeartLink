@@ -244,7 +244,7 @@ class Database:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def create_user(self, data: Dict):
+    async def create_user(self, data: Dict, inviter_id: Optional[int] = None):
         db = self._db()
         now = int(time.time())
         today = datetime.now().strftime("%Y-%m-%d")
@@ -298,22 +298,25 @@ class Database:
                         (today,)
                     )
 
-                    async with db.execute(
-                        "SELECT COUNT(*) AS cnt FROM referrals WHERE inviter_id=? AND rewarded=0",
-                        (data["id"],)
-                    ) as ref_cursor:
-                        ref_row = await ref_cursor.fetchone()
-                        pending_referrals = int(ref_row["cnt"] or 0) if ref_row else 0
+                    # Реферальный бонус только если запись реально вставилась
+                    if inviter_id is not None and inviter_id != data["id"]:
+                        async with db.execute(
+                            "SELECT 1 FROM users WHERE id=?",
+                            (inviter_id,)
+                        ) as inv_cursor:
+                            inviter_exists = await inv_cursor.fetchone()
 
-                    if pending_referrals > 0:
-                        await db.execute(
-                            "UPDATE users SET extra_superlikes = extra_superlikes + ? WHERE id = ?",
-                            (pending_referrals, data["id"])
-                        )
-                        await db.execute(
-                            "UPDATE referrals SET rewarded=1 WHERE inviter_id=? AND rewarded=0",
-                            (data["id"],)
-                        )
+                        if inviter_exists:
+                            ref_cursor = await db.execute(
+                                """INSERT OR IGNORE INTO referrals(inviter_id, invited_id, created, rewarded)
+                                   VALUES(?,?,?,1)""",
+                                (inviter_id, data["id"], now)
+                            )
+                            if ref_cursor.rowcount > 0:
+                                await db.execute(
+                                    "UPDATE users SET extra_superlikes = extra_superlikes + 1 WHERE id = ?",
+                                    (inviter_id,)
+                                )
 
                 await db.commit()
                 return created
@@ -340,8 +343,6 @@ class Database:
             cursor = await self._execute_write(f"UPDATE users SET {set_clause} WHERE id=?", tuple(params))
             if cursor.rowcount > 0:
                 return True
-            # Если rowcount == 0, это может быть как "пользователь не найден",
-            # так и "обновление не изменило значения". Проверим существование.
             return (await self.get_user(uid)) is not None
         except Exception as e:
             logger.error(f"Update user error: {e}")
@@ -508,7 +509,7 @@ class Database:
                 await db.execute("BEGIN IMMEDIATE")
 
                 async with db.execute(
-                    "SELECT id, is_banned FROM users WHERE id=?",
+                    "SELECT id, is_banned, daily_superlikes, extra_superlikes FROM users WHERE id=?",
                     (from_id,)
                 ) as c1:
                     user_from = await c1.fetchone()
@@ -541,22 +542,12 @@ class Database:
                         await db.rollback()
                         return "blocked"
 
-                if is_super:
-                    async with db.execute(
-                        "SELECT daily_superlikes, extra_superlikes FROM users WHERE id=?",
-                        (from_id,)
-                    ) as c4:
-                        quota = await c4.fetchone()
+                daily = int(user_from["daily_superlikes"] or 0)
+                extra = int(user_from["extra_superlikes"] or 0)
 
-                    if not quota:
-                        await db.rollback()
-                        return "no_profile"
-
-                    daily = int(quota["daily_superlikes"] or 0)
-                    extra = int(quota["extra_superlikes"] or 0)
-                    if daily + extra <= 0:
-                        await db.rollback()
-                        return "no_superlikes"
+                if is_super and daily + extra <= 0:
+                    await db.rollback()
+                    return "no_superlikes"
 
                 await db.execute(
                     "INSERT INTO likes(from_id, to_id, is_super, created) VALUES(?,?,?,?)",
@@ -565,12 +556,6 @@ class Database:
                 await db.execute("UPDATE users SET likes = likes + 1 WHERE id = ?", (to_id,))
 
                 if is_super:
-                    async with db.execute(
-                        "SELECT daily_superlikes, extra_superlikes FROM users WHERE id=?",
-                        (from_id,)
-                    ) as c5:
-                        quota = await c5.fetchone()
-                    daily = int(quota["daily_superlikes"] or 0)
                     if daily > 0:
                         await db.execute(
                             "UPDATE users SET daily_superlikes = daily_superlikes - 1 WHERE id = ?",
@@ -778,7 +763,12 @@ class Database:
             min_age, max_age = max_age, min_age
 
         search_gender = viewer.get("search_gender", "Любой")
-        search_radius = int(viewer.get("search_radius", DEFAULT_SEARCH_RADIUS) or DEFAULT_SEARCH_RADIUS)
+
+        radius_value = viewer.get("search_radius")
+        try:
+            search_radius = DEFAULT_SEARCH_RADIUS if radius_value is None else int(radius_value)
+        except (TypeError, ValueError):
+            search_radius = DEFAULT_SEARCH_RADIUS
 
         query = """
             SELECT u.*
@@ -849,7 +839,6 @@ class Database:
 
         candidates = [dict(x) for x in rows]
 
-        # Георадиус — если у обоих есть координаты
         if viewer_lat is not None and viewer_lon is not None and search_radius > 0:
             filtered = []
             for c in candidates:
@@ -870,46 +859,7 @@ class Database:
 
         return random.choice(candidates)
 
-    # ===== РЕФЕРАЛЫ И АДМИН =====
-    async def add_referral(self, inviter, invited):
-        if inviter == invited:
-            return False
-
-        invited_user = await self.get_user(invited)
-        if not invited_user:
-            return False
-
-        db = self._db()
-        async with self._write_lock:
-            try:
-                await db.execute("BEGIN IMMEDIATE")
-                await db.execute(
-                    "INSERT INTO referrals(inviter_id, invited_id, created, rewarded) VALUES(?,?,?,0)",
-                    (inviter, invited, int(time.time()))
-                )
-
-                async with db.execute(
-                    "SELECT 1 FROM users WHERE id=?",
-                    (inviter,)
-                ) as c1:
-                    inviter_exists = bool(await c1.fetchone())
-
-                if inviter_exists:
-                    await db.execute(
-                        "UPDATE users SET extra_superlikes = extra_superlikes + 1 WHERE id = ?",
-                        (inviter,)
-                    )
-                    await db.execute(
-                        "UPDATE referrals SET rewarded=1 WHERE invited_id=?",
-                        (invited,)
-                    )
-
-                await db.commit()
-                return True
-            except Exception:
-                await db.rollback()
-                return False
-
+    # ===== РЕФЕРАЛЫ / АДМИН =====
     async def get_total_revenue(self):
         async with self._db().execute("SELECT SUM(amount_stars) as total FROM payments") as cursor:
             row = await cursor.fetchone()

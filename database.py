@@ -1,9 +1,9 @@
 import asyncio
-import logging
+import math
 import random
 import time
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 
 import aiosqlite
 
@@ -14,9 +14,10 @@ from config import (
     FREE_DAILY_SUPERLIKES,
     PREMIUM_DAILY_SUPERLIKES,
     haversine_km,
-    start_of_today_ts,
     logger,
+    start_of_today_ts,
 )
+
 
 class Database:
     def __init__(self, db_name="dating.db"):
@@ -139,6 +140,7 @@ class Database:
                 inviter_id INTEGER,
                 invited_id INTEGER,
                 created INTEGER,
+                rewarded INTEGER DEFAULT 0,
                 UNIQUE(invited_id)
             );
 
@@ -166,24 +168,60 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_users_city ON users(city);
             CREATE INDEX IF NOT EXISTS idx_users_gender ON users(gender);
             CREATE INDEX IF NOT EXISTS idx_users_search_gender ON users(search_gender);
+            CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active);
+            CREATE INDEX IF NOT EXISTS idx_users_created ON users(created);
+            CREATE INDEX IF NOT EXISTS idx_users_banned ON users(is_banned);
+
             CREATE INDEX IF NOT EXISTS idx_likes_to ON likes(to_id, status);
-            CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(user_id);
+            CREATE INDEX IF NOT EXISTS idx_likes_from ON likes(from_id);
+
+            CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(user_id, blocked_id);
+            CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id);
+
+            CREATE INDEX IF NOT EXISTS idx_views_viewer ON views(viewer_id, created);
+            CREATE INDEX IF NOT EXISTS idx_views_viewed ON views(viewed_id);
+
             CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
             CREATE INDEX IF NOT EXISTS idx_reports_reported ON reports(reported_id, status);
+
+            CREATE INDEX IF NOT EXISTS idx_referrals_inviter ON referrals(inviter_id);
+            CREATE INDEX IF NOT EXISTS idx_referrals_inviter_rewarded ON referrals(inviter_id, rewarded);
         """)
         await db.commit()
 
         # Миграции для существующих баз
-        await self._ensure_column("users", "search_radius", "INTEGER DEFAULT 100")
-        await self._ensure_column("users", "min_age_search", "INTEGER DEFAULT 18")
-        await self._ensure_column("users", "max_age_search", "INTEGER DEFAULT 100")
-        await self._ensure_column("users", "photo_updated", "INTEGER DEFAULT 0")
-        await self._ensure_column("users", "registration_ip", "TEXT DEFAULT ''")
-        await self._ensure_column("users", "last_ip", "TEXT DEFAULT ''")
-
-        await self._ensure_column("likes", "seen", "INTEGER DEFAULT 0")
-        await self._ensure_column("likes", "status", "TEXT DEFAULT 'pending'")
-        await self._ensure_column("reports", "status", "TEXT DEFAULT 'pending'")
+        for table, column, definition in [
+            ("users", "name", "TEXT NOT NULL DEFAULT ''"),
+            ("users", "age", "INTEGER"),
+            ("users", "bio", "TEXT"),
+            ("users", "city", "TEXT"),
+            ("users", "lat", "REAL"),
+            ("users", "lon", "REAL"),
+            ("users", "photo", "TEXT"),
+            ("users", "likes", "INTEGER DEFAULT 0"),
+            ("users", "created", "INTEGER DEFAULT 0"),
+            ("users", "last_active", "INTEGER DEFAULT 0"),
+            ("users", "is_banned", "INTEGER DEFAULT 0"),
+            ("users", "gender", "TEXT DEFAULT 'Не указано'"),
+            ("users", "search_gender", "TEXT DEFAULT 'Любой'"),
+            ("users", "username", "TEXT"),
+            ("users", "is_premium", "INTEGER DEFAULT 0"),
+            ("users", "premium_until", "INTEGER DEFAULT 0"),
+            ("users", "daily_superlikes", "INTEGER DEFAULT 1"),
+            ("users", "extra_superlikes", "INTEGER DEFAULT 0"),
+            ("users", "last_daily_reset", "INTEGER DEFAULT 0"),
+            ("users", "search_radius", "INTEGER DEFAULT 100"),
+            ("users", "min_age_search", "INTEGER DEFAULT 18"),
+            ("users", "max_age_search", "INTEGER DEFAULT 100"),
+            ("users", "photo_updated", "INTEGER DEFAULT 0"),
+            ("users", "registration_ip", "TEXT DEFAULT ''"),
+            ("users", "last_ip", "TEXT DEFAULT ''"),
+            ("likes", "seen", "INTEGER DEFAULT 0"),
+            ("likes", "status", "TEXT DEFAULT 'pending'"),
+            ("reports", "status", "TEXT DEFAULT 'pending'"),
+            ("referrals", "rewarded", "INTEGER DEFAULT 0"),
+        ]:
+            await self._ensure_column(table, column, definition)
 
         logger.info("База данных инициализирована")
 
@@ -245,20 +283,40 @@ class Database:
                         data.get("search_radius", DEFAULT_SEARCH_RADIUS),
                         data.get("min_age_search", DEFAULT_MIN_AGE),
                         data.get("max_age_search", DEFAULT_MAX_AGE),
-                        1,
+                        1 if data.get("photo") else 0,
                         data.get("registration_ip", ""),
                         data.get("last_ip", ""),
                     )
                 )
-                if cursor.rowcount > 0:
+
+                created = cursor.rowcount > 0
+                if created:
                     await db.execute(
                         """INSERT INTO stats(date, new_users)
                            VALUES(?, 1)
-                           ON CONFLICT(date) DO UPDATE SET new_users=new_users+1""",
+                           ON CONFLICT(date) DO UPDATE SET new_users = new_users + 1""",
                         (today,)
                     )
+
+                    async with db.execute(
+                        "SELECT COUNT(*) AS cnt FROM referrals WHERE inviter_id=? AND rewarded=0",
+                        (data["id"],)
+                    ) as ref_cursor:
+                        ref_row = await ref_cursor.fetchone()
+                        pending_referrals = int(ref_row["cnt"] or 0) if ref_row else 0
+
+                    if pending_referrals > 0:
+                        await db.execute(
+                            "UPDATE users SET extra_superlikes = extra_superlikes + ? WHERE id = ?",
+                            (pending_referrals, data["id"])
+                        )
+                        await db.execute(
+                            "UPDATE referrals SET rewarded=1 WHERE inviter_id=? AND rewarded=0",
+                            (data["id"],)
+                        )
+
                 await db.commit()
-                return True
+                return created
             except Exception as e:
                 await db.rollback()
                 logger.error(f"Create user error: {e}")
@@ -279,8 +337,12 @@ class Database:
         set_clause = ", ".join(f"{k}=?" for k in filtered.keys())
         params = list(filtered.values()) + [uid]
         try:
-            await self._execute_write(f"UPDATE users SET {set_clause} WHERE id=?", tuple(params))
-            return True
+            cursor = await self._execute_write(f"UPDATE users SET {set_clause} WHERE id=?", tuple(params))
+            if cursor.rowcount > 0:
+                return True
+            # Если rowcount == 0, это может быть как "пользователь не найден",
+            # так и "обновление не изменило значения". Проверим существование.
+            return (await self.get_user(uid)) is not None
         except Exception as e:
             logger.error(f"Update user error: {e}")
             return False
@@ -291,10 +353,21 @@ class Database:
             return False
 
         now = int(time.time())
-        if u.get("is_premium") and u.get("premium_until", 0) > now:
+        premium_until = int(u.get("premium_until", 0) or 0)
+        is_premium = int(u.get("is_premium", 0) or 0)
+
+        if is_premium and premium_until > now:
             return True
 
-        if u.get("is_premium"):
+        if premium_until > now and not is_premium:
+            await self.update_user(
+                uid,
+                is_premium=1,
+                daily_superlikes=PREMIUM_DAILY_SUPERLIKES
+            )
+            return True
+
+        if is_premium and premium_until <= now:
             await self.update_user(
                 uid,
                 is_premium=0,
@@ -309,7 +382,7 @@ class Database:
             return False
 
         now = int(time.time())
-        current_premium = u.get("premium_until", 0)
+        current_premium = int(u.get("premium_until", 0) or 0)
         start_time = max(now, current_premium)
         premium_until = start_time + (days * 86400)
 
@@ -322,21 +395,25 @@ class Database:
         )
 
     async def give_superlikes(self, uid, count):
-        return await self.update_user(uid, extra_superlikes=(await self.get_user(uid)).get("extra_superlikes", 0) + count)
+        user = await self.get_user(uid)
+        if not user:
+            return False
+        current = int(user.get("extra_superlikes", 0) or 0)
+        return await self.update_user(uid, extra_superlikes=current + count)
 
     async def get_available_superlikes(self, uid):
         u = await self.get_user(uid)
         if not u:
             return 0
-        return int(u.get("daily_superlikes", 0)) + int(u.get("extra_superlikes", 0))
+        return int(u.get("daily_superlikes", 0) or 0) + int(u.get("extra_superlikes", 0) or 0)
 
     async def use_superlike(self, uid):
         u = await self.get_user(uid)
         if not u:
             return False
 
-        daily = int(u.get("daily_superlikes", 0))
-        extra = int(u.get("extra_superlikes", 0))
+        daily = int(u.get("daily_superlikes", 0) or 0)
+        extra = int(u.get("extra_superlikes", 0) or 0)
 
         if daily > 0:
             return await self.update_user(uid, daily_superlikes=daily - 1)
@@ -385,7 +462,7 @@ class Database:
                        VALUES (?,?,?,?,?,?)""",
                     (user_id, amount_stars, payment_type, int(time.time()), telegram_charge_id, provider_charge_id)
                 )
-                if payment_type == "premium":
+                if payment_type == "premium_pack":
                     await db.execute(
                         """INSERT INTO stats(date, premium_purchases, revenue_stars)
                            VALUES(?, 1, ?)
@@ -394,7 +471,7 @@ class Database:
                                revenue_stars = revenue_stars + ?""",
                         (today, amount_stars, amount_stars)
                     )
-                elif payment_type == "superlikes":
+                elif payment_type == "superlikes_pack":
                     await db.execute(
                         """INSERT INTO stats(date, superlike_purchases, revenue_stars)
                            VALUES(?, 1, ?)
@@ -420,17 +497,8 @@ class Database:
 
     # ===== ЛАЙКИ =====
     async def add_like(self, from_id, to_id, is_super=False):
-        user_from = await self.get_user(from_id)
-        user_to = await self.get_user(to_id)
-
-        if not user_from or not user_to:
-            return "no_profile"
-
-        if await self.is_blocked(from_id, to_id):
-            return "blocked"
-
-        if is_super and await self.get_available_superlikes(from_id) <= 0:
-            return "no_superlikes"
+        if from_id == to_id:
+            return "self_like"
 
         db = self._db()
         today = datetime.now().strftime("%Y-%m-%d")
@@ -439,6 +507,57 @@ class Database:
             try:
                 await db.execute("BEGIN IMMEDIATE")
 
+                async with db.execute(
+                    "SELECT id, is_banned FROM users WHERE id=?",
+                    (from_id,)
+                ) as c1:
+                    user_from = await c1.fetchone()
+
+                async with db.execute(
+                    "SELECT id, is_banned FROM users WHERE id=?",
+                    (to_id,)
+                ) as c2:
+                    user_to = await c2.fetchone()
+
+                if not user_from or not user_to:
+                    await db.rollback()
+                    return "no_profile"
+
+                if int(user_from["is_banned"]) == 1 or int(user_to["is_banned"]) == 1:
+                    await db.rollback()
+                    return "blocked"
+
+                async with db.execute(
+                    """
+                    SELECT 1
+                    FROM blocks
+                    WHERE (user_id=? AND blocked_id=?)
+                       OR (user_id=? AND blocked_id=?)
+                    LIMIT 1
+                    """,
+                    (from_id, to_id, to_id, from_id)
+                ) as c3:
+                    if await c3.fetchone():
+                        await db.rollback()
+                        return "blocked"
+
+                if is_super:
+                    async with db.execute(
+                        "SELECT daily_superlikes, extra_superlikes FROM users WHERE id=?",
+                        (from_id,)
+                    ) as c4:
+                        quota = await c4.fetchone()
+
+                    if not quota:
+                        await db.rollback()
+                        return "no_profile"
+
+                    daily = int(quota["daily_superlikes"] or 0)
+                    extra = int(quota["extra_superlikes"] or 0)
+                    if daily + extra <= 0:
+                        await db.rollback()
+                        return "no_superlikes"
+
                 await db.execute(
                     "INSERT INTO likes(from_id, to_id, is_super, created) VALUES(?,?,?,?)",
                     (from_id, to_id, 1 if is_super else 0, int(time.time()))
@@ -446,15 +565,18 @@ class Database:
                 await db.execute("UPDATE users SET likes = likes + 1 WHERE id = ?", (to_id,))
 
                 if is_super:
-                    current = await self.get_user(from_id)
-                    daily = int(current.get("daily_superlikes", 0))
-                    extra = int(current.get("extra_superlikes", 0))
+                    async with db.execute(
+                        "SELECT daily_superlikes, extra_superlikes FROM users WHERE id=?",
+                        (from_id,)
+                    ) as c5:
+                        quota = await c5.fetchone()
+                    daily = int(quota["daily_superlikes"] or 0)
                     if daily > 0:
                         await db.execute(
                             "UPDATE users SET daily_superlikes = daily_superlikes - 1 WHERE id = ?",
                             (from_id,)
                         )
-                    elif extra > 0:
+                    else:
                         await db.execute(
                             "UPDATE users SET extra_superlikes = extra_superlikes - 1 WHERE id = ?",
                             (from_id,)
@@ -542,18 +664,21 @@ class Database:
             WHERE l1.from_id = ?
               AND l1.status = 'accepted'
               AND l2.status = 'accepted'
+              AND u.is_banned = 0
         """, (uid,)) as cursor:
             rows = await cursor.fetchall()
             return [dict(x) for x in rows]
 
     async def get_likes_received(self, uid, limit=10):
         async with self._db().execute("""
-            SELECT u.id, u.name, u.age, u.city, u.photo, u.username, l.is_super, l.created, l.id as like_id
+            SELECT u.id, u.name, u.age, u.city, u.photo, u.username,
+                   l.is_super, l.created, l.id as like_id
             FROM likes l
             JOIN users u ON l.from_id = u.id
             WHERE l.to_id = ?
               AND l.seen = 0
               AND l.status = 'pending'
+              AND u.is_banned = 0
               AND NOT EXISTS(
                   SELECT 1 FROM blocks
                   WHERE (user_id=? AND blocked_id=u.id)
@@ -565,14 +690,22 @@ class Database:
             rows = await cursor.fetchall()
             return [dict(x) for x in rows]
 
-    async def mark_likes_seen(self, uid):
+    async def mark_like_seen(self, like_id: int):
         await self._execute_write(
-            "UPDATE likes SET seen=1 WHERE to_id=? AND status='pending'",
-            (uid,)
+            "UPDATE likes SET seen=1 WHERE id=?",
+            (like_id,)
         )
 
     # ===== БЛОКИРОВКИ / ПРОСМОТРЫ / ЖАЛОБЫ =====
     async def block_user(self, uid, bid):
+        if uid == bid:
+            return False
+
+        user_a = await self.get_user(uid)
+        user_b = await self.get_user(bid)
+        if not user_a or not user_b:
+            return False
+
         db = self._db()
         async with self._write_lock:
             try:
@@ -602,13 +735,23 @@ class Database:
     async def add_view(self, vid, vid2):
         try:
             await self._execute_write(
-                "INSERT OR IGNORE INTO views(viewer_id, viewed_id, created) VALUES(?,?,?)",
+                """INSERT INTO views(viewer_id, viewed_id, created)
+                   VALUES(?,?,?)
+                   ON CONFLICT(viewer_id, viewed_id) DO UPDATE SET created=excluded.created""",
                 (vid, vid2, int(time.time()))
             )
         except Exception:
             pass
 
     async def add_report(self, reporter_id: int, reported_id: int, reason: str):
+        if reporter_id == reported_id:
+            return False
+
+        reporter = await self.get_user(reporter_id)
+        reported = await self.get_user(reported_id)
+        if not reporter or not reported:
+            return False
+
         db = self._db()
         async with self._write_lock:
             try:
@@ -631,6 +774,9 @@ class Database:
 
         min_age = int(viewer.get("min_age_search", DEFAULT_MIN_AGE) or DEFAULT_MIN_AGE)
         max_age = int(viewer.get("max_age_search", DEFAULT_MAX_AGE) or DEFAULT_MAX_AGE)
+        if min_age > max_age:
+            min_age, max_age = max_age, min_age
+
         search_gender = viewer.get("search_gender", "Любой")
         search_radius = int(viewer.get("search_radius", DEFAULT_SEARCH_RADIUS) or DEFAULT_SEARCH_RADIUS)
 
@@ -674,18 +820,47 @@ class Database:
             query += " AND u.gender = ?"
             params.append(search_gender)
 
+        viewer_lat = viewer.get("lat")
+        viewer_lon = viewer.get("lon")
+        if viewer_lat is not None and viewer_lon is not None and search_radius > 0:
+            viewer_lat = float(viewer_lat)
+            viewer_lon = float(viewer_lon)
+            delta_lat = search_radius / 111.0
+            cos_lat = max(math.cos(math.radians(viewer_lat)), 0.01)
+            delta_lon = search_radius / (111.320 * cos_lat)
+
+            lat_min = max(-90.0, viewer_lat - delta_lat)
+            lat_max = min(90.0, viewer_lat + delta_lat)
+            lon_min = max(-180.0, viewer_lon - delta_lon)
+            lon_max = min(180.0, viewer_lon + delta_lon)
+
+            query += """
+              AND u.lat IS NOT NULL
+              AND u.lon IS NOT NULL
+              AND u.lat BETWEEN ? AND ?
+              AND u.lon BETWEEN ? AND ?
+            """
+            params.extend([lat_min, lat_max, lon_min, lon_max])
+
+        query += " ORDER BY u.last_active DESC, u.created DESC LIMIT 500"
+
         async with self._db().execute(query, tuple(params)) as cursor:
             rows = await cursor.fetchall()
 
         candidates = [dict(x) for x in rows]
 
         # Георадиус — если у обоих есть координаты
-        if viewer.get("lat") is not None and viewer.get("lon") is not None and search_radius > 0:
+        if viewer_lat is not None and viewer_lon is not None and search_radius > 0:
             filtered = []
             for c in candidates:
                 if c.get("lat") is None or c.get("lon") is None:
                     continue
-                dist = haversine_km(float(viewer["lat"]), float(viewer["lon"]), float(c["lat"]), float(c["lon"]))
+                dist = haversine_km(
+                    float(viewer_lat),
+                    float(viewer_lon),
+                    float(c["lat"]),
+                    float(c["lon"])
+                )
                 if dist <= search_radius:
                     filtered.append(c)
             candidates = filtered
@@ -700,9 +875,8 @@ class Database:
         if inviter == invited:
             return False
 
-        inviter_user = await self.get_user(inviter)
         invited_user = await self.get_user(invited)
-        if not inviter_user or not invited_user:
+        if not invited_user:
             return False
 
         db = self._db()
@@ -710,13 +884,26 @@ class Database:
             try:
                 await db.execute("BEGIN IMMEDIATE")
                 await db.execute(
-                    "INSERT INTO referrals(inviter_id, invited_id, created) VALUES(?,?,?)",
+                    "INSERT INTO referrals(inviter_id, invited_id, created, rewarded) VALUES(?,?,?,0)",
                     (inviter, invited, int(time.time()))
                 )
-                await db.execute(
-                    "UPDATE users SET extra_superlikes = extra_superlikes + 1 WHERE id = ?",
+
+                async with db.execute(
+                    "SELECT 1 FROM users WHERE id=?",
                     (inviter,)
-                )
+                ) as c1:
+                    inviter_exists = bool(await c1.fetchone())
+
+                if inviter_exists:
+                    await db.execute(
+                        "UPDATE users SET extra_superlikes = extra_superlikes + 1 WHERE id = ?",
+                        (inviter,)
+                    )
+                    await db.execute(
+                        "UPDATE referrals SET rewarded=1 WHERE invited_id=?",
+                        (invited,)
+                    )
+
                 await db.commit()
                 return True
             except Exception:

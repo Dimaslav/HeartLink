@@ -683,14 +683,13 @@ async def process_bio(message: Message, state: FSMContext):
     data["id"] = message.from_user.id
     data["username"] = message.from_user.username or ""
 
-    ok = await db.create_user(data)
+    inviter_id = data.get("referral_inviter_id")
+    inviter_id = int(inviter_id) if inviter_id else None
+
+    ok = await db.create_user(data, inviter_id=inviter_id)
     if not ok:
         await state.clear()
         return await message.answer("❌ Не удалось создать анкету. Попробуйте позже.")
-
-    inviter_id = data.get("referral_inviter_id")
-    if inviter_id:
-        await db.add_referral(int(inviter_id), message.from_user.id)
 
     await state.clear()
     is_premium = await db.check_premium(message.from_user.id)
